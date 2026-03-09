@@ -6,8 +6,8 @@ from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QKeySequence, QPixmap
+from PyQt5.QtCore import QPoint, QRect, Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
 from camera.realsense_camera import CameraConfig, RealSenseCamera
 from processing.normals import NormalsEstimator
 from utils.metadata import SessionMetadataManager
-from utils.roi import ROI, select_roi_with_opencv
+from utils.roi import ROI
 from utils.saver import DatasetSaver
 
 CAMERA_KEYS = ("left", "middle", "right")
@@ -44,6 +44,130 @@ CAMERA_TEXT = {
     "middle": "中",
     "right": "右",
 }
+
+
+class PreviewLabel(QLabel):
+    roi_selected = pyqtSignal(str, object)  # camera_key, ROI
+
+    def __init__(self, camera_key: str, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.camera_key = camera_key
+        self.image_size: Optional[Tuple[int, int]] = None  # (w, h)
+        self.active_roi: Optional[ROI] = None
+        self.roi_edit_enabled: bool = False
+        self._drag_start: Optional[QPoint] = None
+        self._drag_current: Optional[QPoint] = None
+
+    def set_image_size(self, image_w: int, image_h: int) -> None:
+        self.image_size = (int(image_w), int(image_h))
+
+    def set_active_roi(self, roi: Optional[ROI]) -> None:
+        self.active_roi = roi
+        self.update()
+
+    def set_roi_edit_enabled(self, enabled: bool) -> None:
+        self.roi_edit_enabled = bool(enabled)
+        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        if not enabled:
+            self._drag_start = None
+            self._drag_current = None
+        self.update()
+
+    def _display_rect(self) -> Optional[QRect]:
+        pix = self.pixmap()
+        if pix is None or pix.isNull():
+            return None
+        x = (self.width() - pix.width()) // 2
+        y = (self.height() - pix.height()) // 2
+        return QRect(x, y, pix.width(), pix.height())
+
+    def _label_rect_to_roi(self, rect: QRect) -> Optional[ROI]:
+        if self.image_size is None:
+            return None
+        display = self._display_rect()
+        if display is None or display.width() <= 0 or display.height() <= 0:
+            return None
+
+        clipped = rect.normalized().intersected(display)
+        if clipped.isNull() or clipped.width() < 2 or clipped.height() < 2:
+            return None
+
+        image_w, image_h = self.image_size
+        scale_x = image_w / float(display.width())
+        scale_y = image_h / float(display.height())
+
+        x = int(round((clipped.x() - display.x()) * scale_x))
+        y = int(round((clipped.y() - display.y()) * scale_y))
+        w = int(round(clipped.width() * scale_x))
+        h = int(round(clipped.height() * scale_y))
+
+        roi = ROI(x=x, y=y, w=w, h=h).clamp((image_h, image_w))
+        return roi if roi.is_valid() else None
+
+    def _roi_to_label_rect(self, roi: ROI) -> Optional[QRect]:
+        if self.image_size is None:
+            return None
+        display = self._display_rect()
+        if display is None or display.width() <= 0 or display.height() <= 0:
+            return None
+
+        image_w, image_h = self.image_size
+        if image_w <= 0 or image_h <= 0:
+            return None
+
+        x = display.x() + int(round((roi.x / float(image_w)) * display.width()))
+        y = display.y() + int(round((roi.y / float(image_h)) * display.height()))
+        w = int(round((roi.w / float(image_w)) * display.width()))
+        h = int(round((roi.h / float(image_h)) * display.height()))
+        return QRect(x, y, max(1, w), max(1, h))
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if self.roi_edit_enabled and event.button() == Qt.LeftButton:
+            display = self._display_rect()
+            if display is not None and display.contains(event.pos()):
+                self._drag_start = event.pos()
+                self._drag_current = event.pos()
+                self.update()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self.roi_edit_enabled and self._drag_start is not None:
+            self._drag_current = event.pos()
+            self.update()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self.roi_edit_enabled and self._drag_start is not None and event.button() == Qt.LeftButton:
+            self._drag_current = event.pos()
+            drag_rect = QRect(self._drag_start, self._drag_current).normalized()
+            roi = self._label_rect_to_roi(drag_rect)
+            self._drag_start = None
+            self._drag_current = None
+            self.update()
+            if roi is not None:
+                self.roi_selected.emit(self.camera_key, roi)
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        if self.active_roi is not None:
+            rect = self._roi_to_label_rect(self.active_roi)
+            if rect is not None:
+                painter.setPen(QPen(QColor(56, 201, 92), 2))
+                painter.drawRect(rect)
+
+        if self.roi_edit_enabled and self._drag_start is not None and self._drag_current is not None:
+            drag_rect = QRect(self._drag_start, self._drag_current).normalized()
+            painter.setPen(QPen(QColor(255, 196, 0), 2, Qt.DashLine))
+            painter.drawRect(drag_rect)
+
+        painter.end()
 
 
 class CameraWorker(QThread):
@@ -117,7 +241,8 @@ class MainWindow(QMainWindow):
         self.latest_color_bgr: Dict[str, np.ndarray] = {}
         self.latest_depth_u16: Dict[str, np.ndarray] = {}
 
-        self.current_roi: Optional[ROI] = None
+        self.roi_by_camera: Dict[str, ROI] = {}
+        self.roi_edit_mode: bool = False
 
         self.light_button_group = QButtonGroup(self)
         self.light_button_group.setExclusive(True)
@@ -155,8 +280,9 @@ class MainWindow(QMainWindow):
         preview_splitter.setHandleWidth(8)
 
         for key in CAMERA_KEYS:
-            panel = self._make_camera_panel(f"{CAMERA_TEXT[key]}路相机")
+            panel = self._make_camera_panel(key, f"{CAMERA_TEXT[key]}路相机")
             self.preview_views[key] = panel
+            panel["image_label"].roi_selected.connect(self._on_preview_roi_selected)
             preview_splitter.addWidget(panel["container"])
 
         preview_splitter.setStretchFactor(0, 1)
@@ -255,8 +381,9 @@ class MainWindow(QMainWindow):
 
         roi_row = QHBoxLayout()
         self.check_enable_roi = QCheckBox("启用 ROI")
-        self.btn_set_roi = QPushButton("设置 ROI")
-        self.btn_clear_roi = QPushButton("清除 ROI")
+        self.btn_set_roi = QPushButton("设置 ROI（框选模式）")
+        self.btn_set_roi.setCheckable(True)
+        self.btn_clear_roi = QPushButton("清除全部 ROI")
         roi_row.addWidget(self.check_enable_roi)
         roi_row.addWidget(self.btn_set_roi)
         roi_row.addWidget(self.btn_clear_roi)
@@ -313,7 +440,7 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("就绪")
 
-    def _make_camera_panel(self, title: str) -> Dict[str, QWidget]:
+    def _make_camera_panel(self, camera_key: str, title: str) -> Dict[str, QWidget]:
         container = QWidget()
         container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(container)
@@ -323,7 +450,7 @@ class MainWindow(QMainWindow):
         title_label = QLabel(title)
         title_label.setAlignment(Qt.AlignCenter)
 
-        image_label = QLabel("No Frame")
+        image_label = PreviewLabel(camera_key, "No Frame")
         image_label.setAlignment(Qt.AlignCenter)
         image_label.setMinimumSize(280, 210)
         image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -421,7 +548,7 @@ class MainWindow(QMainWindow):
         self.light_button_group.buttonClicked.connect(self._on_light_label_changed)
 
         self.check_enable_roi.toggled.connect(self._on_roi_toggled)
-        self.btn_set_roi.clicked.connect(self.set_roi)
+        self.btn_set_roi.toggled.connect(self._on_roi_edit_mode_toggled)
         self.btn_clear_roi.clicked.connect(self.clear_roi)
 
     def _setup_shortcuts(self) -> None:
@@ -499,9 +626,40 @@ class MainWindow(QMainWindow):
     def _on_light_label_changed(self) -> None:
         self.lbl_light_status.setText(self.get_selected_light_label())
 
-    def _on_roi_toggled(self, _: bool) -> None:
+    def _on_roi_toggled(self, enabled: bool) -> None:
+        if not enabled and self.btn_set_roi.isChecked():
+            self.btn_set_roi.setChecked(False)
+        self._set_preview_roi_edit_enabled(enabled and self.roi_edit_mode)
         self._update_roi_status()
         self._refresh_all_previews()
+
+    def _on_roi_edit_mode_toggled(self, enabled: bool) -> None:
+        if enabled and not self.check_enable_roi.isChecked():
+            self.check_enable_roi.setChecked(True)
+        self.roi_edit_mode = bool(enabled)
+        self._set_preview_roi_edit_enabled(self.check_enable_roi.isChecked() and self.roi_edit_mode)
+        if self.roi_edit_mode:
+            self.statusBar().showMessage("ROI 框选模式已开启：请在左/中/右预览框内拖拽设置各自 ROI。", 5000)
+        else:
+            self.statusBar().showMessage("ROI 框选模式已关闭。", 3000)
+
+    def _set_preview_roi_edit_enabled(self, enabled: bool) -> None:
+        for key in CAMERA_KEYS:
+            label = self.preview_views[key]["image_label"]
+            if isinstance(label, PreviewLabel):
+                label.set_roi_edit_enabled(enabled)
+
+    def _on_preview_roi_selected(self, camera_key: str, roi_obj: object) -> None:
+        if not isinstance(roi_obj, ROI):
+            return
+        self.roi_by_camera[camera_key] = roi_obj
+        self._update_roi_status()
+        self._refresh_preview(camera_key)
+        self.statusBar().showMessage(
+            f"{CAMERA_TEXT.get(camera_key, camera_key)}路 ROI 已设置: "
+            f"x={roi_obj.x}, y={roi_obj.y}, w={roi_obj.w}, h={roi_obj.h}",
+            3500,
+        )
 
     def _add_light_label_button(self, label: str, checked: bool = False) -> None:
         if label in self.light_buttons:
@@ -669,6 +827,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"设备 SN:{source_key}（{bound_views}）: {msg}", 6000)
         else:
             self.statusBar().showMessage(f"设备 SN:{source_key}: {msg}", 6000)
+        for view_key in self.source_to_views.get(source_key, []):
+            label = self.preview_views[view_key]["image_label"]
+            if isinstance(label, QLabel):
+                label.setText("取流失败，请查看状态栏错误信息")
+                label.setPixmap(QPixmap())
 
     def _on_frame_ready(self, source_key: str, color_bgr: np.ndarray, depth_u16: np.ndarray) -> None:
         bound_views = self.source_to_views.get(source_key, [])
@@ -676,8 +839,8 @@ class MainWindow(QMainWindow):
             return
 
         for view_key in bound_views:
-            self.latest_color_bgr[view_key] = color_bgr
-            self.latest_depth_u16[view_key] = depth_u16
+            self.latest_color_bgr[view_key] = color_bgr.copy()
+            self.latest_depth_u16[view_key] = depth_u16.copy()
             self._refresh_preview(view_key)
 
     def _refresh_preview(self, camera_key: str) -> None:
@@ -685,14 +848,11 @@ class MainWindow(QMainWindow):
         if img is None:
             return
 
-        disp = img.copy()
-        if self.check_enable_roi.isChecked() and self.current_roi is not None:
-            roi = self.current_roi.clamp(disp.shape[:2])
-            if roi.is_valid():
-                cv2.rectangle(disp, (roi.x, roi.y), (roi.x + roi.w, roi.y + roi.h), (0, 255, 0), 2)
-
         label = self.preview_views[camera_key]["image_label"]
-        self._set_image_to_label(label, disp)
+        self._set_image_to_label(label, img)
+        if isinstance(label, PreviewLabel):
+            roi = self.roi_by_camera.get(camera_key) if self.check_enable_roi.isChecked() else None
+            label.set_active_roi(roi)
 
     def _refresh_all_previews(self) -> None:
         for key in CAMERA_KEYS:
@@ -703,8 +863,14 @@ class MainWindow(QMainWindow):
         h, w, c = rgb.shape
         bytes_per_line = c * w
         qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
-        pix = QPixmap.fromImage(qimg).scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        target_size = label.size()
+        if target_size.width() <= 1 or target_size.height() <= 1:
+            target_size = label.minimumSize()
+        pix = QPixmap.fromImage(qimg).scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        label.setText("")
         label.setPixmap(pix)
+        if isinstance(label, PreviewLabel):
+            label.set_image_size(w, h)
 
     def choose_save_root(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择保存目录", str(self.saver.root_dir))
@@ -749,49 +915,28 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(f"保存目录已切换: {self.saver.root_dir}")
 
-    def set_roi(self) -> None:
-        source = self.latest_color_bgr.get("middle")
-        if source is None:
-            for key in CAMERA_KEYS:
-                source = self.latest_color_bgr.get(key)
-                if source is not None:
-                    break
-
-        if source is None:
-            QMessageBox.warning(self, "提示", "当前没有可用的 RGB 帧，无法设置 ROI。")
-            return
-
-        roi = select_roi_with_opencv(source, window_name="Select ROI (Enter确认 / C取消)")
-        if roi is None:
-            self.statusBar().showMessage("未设置 ROI")
-            return
-
-        clamped = roi.clamp(source.shape[:2])
-        if not clamped.is_valid():
-            QMessageBox.warning(self, "提示", "ROI 非法，请重新选择。")
-            return
-
-        self.current_roi = clamped
-        self.check_enable_roi.setChecked(True)
-        self._update_roi_status()
-        self._refresh_all_previews()
-        self.statusBar().showMessage(f"ROI 已设置: x={clamped.x}, y={clamped.y}, w={clamped.w}, h={clamped.h}")
-
     def clear_roi(self) -> None:
-        self.current_roi = None
-        self.check_enable_roi.setChecked(False)
+        self.roi_by_camera.clear()
+        if self.btn_set_roi.isChecked():
+            self.btn_set_roi.setChecked(False)
         self._update_roi_status()
         self._refresh_all_previews()
-        self.statusBar().showMessage("ROI 已清除")
+        self.statusBar().showMessage("三路 ROI 已清除", 3000)
 
     def _update_roi_status(self) -> None:
-        if self.check_enable_roi.isChecked() and self.current_roi is not None:
-            r = self.current_roi
-            self.lbl_roi_status.setText(f"启用 ({r.x}, {r.y}, {r.w}, {r.h})")
-        elif self.check_enable_roi.isChecked():
-            self.lbl_roi_status.setText("启用但未设置")
-        else:
+        if not self.check_enable_roi.isChecked():
             self.lbl_roi_status.setText("未启用")
+            return
+
+        parts = []
+        for key in CAMERA_KEYS:
+            roi = self.roi_by_camera.get(key)
+            if roi is None:
+                parts.append(f"{CAMERA_TEXT[key]}:未设置")
+            else:
+                parts.append(f"{CAMERA_TEXT[key]}:({roi.x},{roi.y},{roi.w},{roi.h})")
+        suffix = " | 框选中" if self.roi_edit_mode else ""
+        self.lbl_roi_status.setText("启用 " + " / ".join(parts) + suffix)
 
     def _update_metadata_status(self) -> None:
         if self.metadata_manager.has_unexported_changes:
@@ -801,25 +946,24 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_metadata_status.setText("已导出")
 
-    def _get_save_roi(self) -> Optional[ROI]:
+    def _get_save_roi_by_camera(self) -> Dict[str, ROI]:
         if not self.check_enable_roi.isChecked():
-            return None
+            return {}
 
-        if self.current_roi is None:
-            raise RuntimeError("ROI 已启用但尚未设置，请先点击“设置 ROI”。")
+        missing = [CAMERA_TEXT[key] for key in CAMERA_KEYS if key not in self.roi_by_camera]
+        if missing:
+            raise RuntimeError(f"ROI 已启用，请先在预览框内设置这些相机的 ROI：{', '.join(missing)}。")
 
-        source = self.latest_color_bgr.get("middle")
-        if source is None:
-            source = self.latest_color_bgr.get("left")
-        if source is None:
-            source = self.latest_color_bgr.get("right")
-        if source is None:
-            raise RuntimeError("当前没有可用图像，无法应用 ROI。")
-
-        clamped = self.current_roi.clamp(source.shape[:2])
-        if not clamped.is_valid():
-            raise RuntimeError("当前 ROI 非法，请重新设置。")
-        return clamped
+        result: Dict[str, ROI] = {}
+        for key in CAMERA_KEYS:
+            source = self.latest_color_bgr.get(key)
+            if source is None:
+                raise RuntimeError(f"{CAMERA_TEXT[key]}路当前没有可用图像，无法应用 ROI。")
+            clamped = self.roi_by_camera[key].clamp(source.shape[:2])
+            if not clamped.is_valid():
+                raise RuntimeError(f"{CAMERA_TEXT[key]}路 ROI 非法，请重新设置。")
+            result[key] = clamped
+        return result
 
     def capture_and_save(self) -> None:
         for key in CAMERA_KEYS:
@@ -831,7 +975,7 @@ class MainWindow(QMainWindow):
                 return
 
         try:
-            roi = self._get_save_roi()
+            roi_by_camera = self._get_save_roi_by_camera()
 
             frames: Dict[str, Dict[str, np.ndarray]] = {}
             for key in CAMERA_KEYS:
@@ -850,7 +994,7 @@ class MainWindow(QMainWindow):
             record = self.saver.save_multi_sample(
                 camera_frames=frames,
                 light_label=self.get_selected_light_label(),
-                roi=roi,
+                roi_by_camera=roi_by_camera,
             )
 
             self.metadata_manager.add_record(record)
@@ -858,7 +1002,7 @@ class MainWindow(QMainWindow):
             self.lbl_last_save_status.setText(f"成功: {record['sample_name']}")
             self.lbl_sample_id_status.setText(f"{self.saver.next_sample_id():06d}")
             self._update_metadata_status()
-            self.statusBar().showMessage(f"样本保存成功: {record['sample_name']}")
+            self.statusBar().showMessage(f"样本保存成功: {record['sample_name']}", 3000)
 
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", str(exc))
@@ -887,7 +1031,7 @@ class MainWindow(QMainWindow):
             self.lbl_last_delete_status.setText(f"成功: {sample_name}")
             self.btn_delete_last.setEnabled(self.metadata_manager.record_count > 0)
             self._update_metadata_status()
-            self.statusBar().showMessage(f"已删除样本: {sample_name}")
+            self.statusBar().showMessage(f"已删除样本: {sample_name}", 3000)
         except Exception as exc:
             QMessageBox.critical(self, "删除失败", str(exc))
             self.lbl_last_delete_status.setText(f"失败: {exc}")
@@ -904,7 +1048,7 @@ class MainWindow(QMainWindow):
         try:
             paths = self.metadata_manager.export(str(self.saver.root_dir))
             self._update_metadata_status()
-            self.statusBar().showMessage(f"导出完成: {paths['metadata_json']} | {paths['index_csv']}")
+            self.statusBar().showMessage(f"导出完成: {paths['metadata_json']} | {paths['index_csv']}", 4000)
             return True
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", str(exc))

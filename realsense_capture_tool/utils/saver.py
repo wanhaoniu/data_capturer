@@ -224,7 +224,8 @@ class DatasetSaver:
         self,
         camera_frames: Dict[str, Dict[str, np.ndarray]],
         light_label: str,
-        roi: Optional[ROI],
+        roi: Optional[ROI] = None,
+        roi_by_camera: Optional[Dict[str, ROI]] = None,
     ) -> Dict:
         missing = [k for k in CAMERA_KEYS if k not in camera_frames]
         if missing:
@@ -234,8 +235,9 @@ class DatasetSaver:
         clean_label = self.sanitize_light_label(light_label)
         sample_name = f"{sample_id:06d}_{clean_label}"
 
-        roi_enabled = roi is not None
-        roi_record = {"roi_x": 0, "roi_y": 0, "roi_w": 0, "roi_h": 0}
+        roi_map = dict(roi_by_camera or {})
+        roi_enabled = (roi is not None) or (len(roi_map) > 0)
+        zero_roi = {"roi_x": 0, "roi_y": 0, "roi_w": 0, "roi_h": 0}
 
         written = []
         record: Dict = {
@@ -243,14 +245,19 @@ class DatasetSaver:
             "sample_name": sample_name,
             "light_label": clean_label,
             "roi_enabled": bool(roi_enabled),
-            "roi_x": int(roi_record["roi_x"]),
-            "roi_y": int(roi_record["roi_y"]),
-            "roi_w": int(roi_record["roi_w"]),
-            "roi_h": int(roi_record["roi_h"]),
+            "roi_x": int(zero_roi["roi_x"]),
+            "roi_y": int(zero_roi["roi_y"]),
+            "roi_w": int(zero_roi["roi_w"]),
+            "roi_h": int(zero_roi["roi_h"]),
             "depth_aligned_to_color": True,
             "intrinsics_file": self.camera_intrinsics_file.name,
             "saved_in_session": True,
         }
+        for cam_key in CAMERA_KEYS:
+            record[f"{cam_key}_roi_x"] = 0
+            record[f"{cam_key}_roi_y"] = 0
+            record[f"{cam_key}_roi_w"] = 0
+            record[f"{cam_key}_roi_h"] = 0
 
         try:
             for cam_key in CAMERA_KEYS:
@@ -273,15 +280,20 @@ class DatasetSaver:
                 color_to_save = color_bgr
                 depth_to_save = depth_u16
                 normals_to_save = normals_vis_bgr
+                cam_roi_record = dict(zero_roi)
 
-                if roi is not None:
-                    clamped = roi.clamp(color_bgr.shape[:2])
+                cam_roi = roi_map.get(cam_key)
+                if cam_roi is None and roi is not None:
+                    cam_roi = roi
+
+                if cam_roi is not None:
+                    clamped = cam_roi.clamp(color_bgr.shape[:2])
                     if not clamped.is_valid():
                         raise RuntimeError(f"{cam_key} ROI 非法。")
                     color_to_save = crop_with_roi(color_bgr, clamped)
                     depth_to_save = crop_with_roi(depth_u16, clamped)
                     normals_to_save = crop_with_roi(normals_vis_bgr, clamped)
-                    roi_record = clamped.to_dict()
+                    cam_roi_record = clamped.to_dict()
 
                 cam_sample_name = f"{sample_name}_{cam_key}"
                 rgb_rel = Path("rgb") / f"{cam_sample_name}_rgb.png"
@@ -316,11 +328,30 @@ class DatasetSaver:
                 record[f"{cam_key}_normals_path"] = normals_rel.as_posix()
                 record[f"{cam_key}_width"] = int(w)
                 record[f"{cam_key}_height"] = int(h)
+                record[f"{cam_key}_roi_x"] = int(cam_roi_record["roi_x"])
+                record[f"{cam_key}_roi_y"] = int(cam_roi_record["roi_y"])
+                record[f"{cam_key}_roi_w"] = int(cam_roi_record["roi_w"])
+                record[f"{cam_key}_roi_h"] = int(cam_roi_record["roi_h"])
 
-            record["roi_x"] = int(roi_record["roi_x"])
-            record["roi_y"] = int(roi_record["roi_y"])
-            record["roi_w"] = int(roi_record["roi_w"])
-            record["roi_h"] = int(roi_record["roi_h"])
+            fallback = (
+                record.get("middle_roi_x", 0),
+                record.get("middle_roi_y", 0),
+                record.get("middle_roi_w", 0),
+                record.get("middle_roi_h", 0),
+            )
+            if fallback[2] <= 0 or fallback[3] <= 0:
+                for cam_key in CAMERA_KEYS:
+                    fw = int(record.get(f"{cam_key}_roi_w", 0))
+                    fh = int(record.get(f"{cam_key}_roi_h", 0))
+                    if fw > 0 and fh > 0:
+                        fallback = (
+                            int(record.get(f"{cam_key}_roi_x", 0)),
+                            int(record.get(f"{cam_key}_roi_y", 0)),
+                            fw,
+                            fh,
+                        )
+                        break
+            record["roi_x"], record["roi_y"], record["roi_w"], record["roi_h"] = fallback
 
         except Exception as exc:
             for path in written:
