@@ -10,6 +10,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QFileDialog,
+    QFrame,
     QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
@@ -21,8 +22,10 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QComboBox,
     QLineEdit,
+    QScrollArea,
     QSpinBox,
     QSplitter,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -87,20 +90,29 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         root_layout = QHBoxLayout(central)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(8)
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
         root_layout.addWidget(splitter)
 
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
+        left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.setChildrenCollapsible(False)
 
+        preview_group = QGroupBox("相机预览")
+        preview_layout = QVBoxLayout(preview_group)
         self.camera_label = QLabel("相机画面")
         self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setMinimumSize(800, 600)
+        self.camera_label.setMinimumSize(320, 240)
+        self.camera_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.camera_label.setStyleSheet("background-color: #111; color: #ddd; border: 1px solid #333;")
-        left_layout.addWidget(self.camera_label, stretch=1)
+        preview_layout.addWidget(self.camera_label)
+        left_splitter.addWidget(preview_group)
 
         button_group = QGroupBox("控制")
         button_layout = QGridLayout(button_group)
+        button_layout.setHorizontalSpacing(8)
+        button_layout.setVerticalSpacing(8)
 
         self.btn_open_camera = QPushButton("打开相机")
         self.btn_close_camera = QPushButton("关闭相机")
@@ -128,12 +140,19 @@ class MainWindow(QMainWindow):
         for idx, button in enumerate(buttons):
             row = idx // 5
             col = idx % 5
+            button.setMinimumHeight(40)
             button_layout.addWidget(button, row, col)
-
-        left_layout.addWidget(button_group, stretch=0)
+        for col in range(5):
+            button_layout.setColumnStretch(col, 1)
+        left_splitter.addWidget(button_group)
+        left_splitter.setStretchFactor(0, 5)
+        left_splitter.setStretchFactor(1, 1)
+        left_splitter.setSizes([700, 220])
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
 
         param_group = QGroupBox("参数设置")
         param_layout = QFormLayout(param_group)
@@ -263,9 +282,16 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_text)
         right_layout.addWidget(log_group, stretch=1)
 
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([1000, 600])
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_scroll.setWidget(right_panel)
+
+        splitter.addWidget(left_splitter)
+        splitter.addWidget(right_scroll)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([1100, 600])
 
         self.btn_open_camera.clicked.connect(self.open_camera)
         self.btn_close_camera.clicked.connect(self.close_camera)
