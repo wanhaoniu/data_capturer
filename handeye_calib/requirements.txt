@@ -1,0 +1,7 @@
+numpy>=1.23
+scipy>=1.9
+opencv-python>=4.8
+PyQt5>=5.15
+pyrealsense2>=2.54
+PyYAML>=6.0
+UrRtde @ git+https://github.com/UniversalRobots/RTDE_Python_Client_Library.git@master
