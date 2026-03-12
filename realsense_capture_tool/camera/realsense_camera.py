@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import json
 import subprocess
 import sys
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -168,13 +168,15 @@ ctx = rs.context()
 devices = ctx.query_devices()
 items = []
 for i in range(int(len(devices))):
-    entry = {"name": "", "serial_number": "", "firmware_version": ""}
+    entry = {"name": "", "serial_number": "", "firmware_version": "", "usb_type": "", "product_line": ""}
     try:
         dev = devices[i]
         for key, field in [
             (rs.camera_info.name, "name"),
             (rs.camera_info.serial_number, "serial_number"),
             (rs.camera_info.firmware_version, "firmware_version"),
+            (rs.camera_info.usb_type_descriptor, "usb_type"),
+            (rs.camera_info.product_line, "product_line"),
         ]:
             try:
                 entry[field] = dev.get_info(key)
@@ -264,6 +266,11 @@ try:
     c.enable_stream(rs.stream.color, {int(width)}, {int(height)}, rs.format.bgr8, {int(fps)})
     c.enable_stream(rs.stream.depth, {int(width)}, {int(height)}, rs.format.z16, {int(fps)})
     p.start(c)
+    frames = p.wait_for_frames(3000)
+    color = frames.get_color_frame()
+    depth = frames.get_depth_frame()
+    if not color or not depth:
+        raise RuntimeError("未获取到完整的 color/depth 帧。")
     p.stop()
     result["ok"] = True
 except Exception as e:
@@ -321,6 +328,153 @@ print(json.dumps(result, ensure_ascii=False))
                 "crashed": False,
                 "returncode": completed.returncode,
             }
+
+    @staticmethod
+    def probe_multi_stream_start_safe(
+        serial_numbers: List[str],
+        width: int,
+        height: int,
+        fps: int,
+        timeout_sec: float = 20.0,
+        startup_delay_sec: float = 0.35,
+    ) -> Dict:
+        """
+        Start multiple pipelines sequentially in a subprocess and wait for frames from all devices.
+        """
+        serials = [str(item).strip() for item in serial_numbers if str(item).strip()]
+        probe_code = f"""
+import json
+import time
+import pyrealsense2 as rs
+
+serials = {serials!r}
+result = {{
+    "ok": False,
+    "error": "",
+    "failed_serial": "",
+    "stage": "",
+    "started": [],
+    "framed": [],
+}}
+pipes = []
+
+try:
+    for serial in serials:
+        result["stage"] = "start"
+        result["failed_serial"] = serial
+
+        p = rs.pipeline()
+        c = rs.config()
+        c.enable_device(serial)
+        c.enable_stream(rs.stream.color, {int(width)}, {int(height)}, rs.format.bgr8, {int(fps)})
+        c.enable_stream(rs.stream.depth, {int(width)}, {int(height)}, rs.format.z16, {int(fps)})
+        p.start(c)
+        pipes.append((serial, p))
+        result["started"].append(serial)
+        time.sleep({float(startup_delay_sec)!r})
+
+    for serial, p in pipes:
+        result["stage"] = "frames"
+        result["failed_serial"] = serial
+        frames = p.wait_for_frames(4000)
+        color = frames.get_color_frame()
+        depth = frames.get_depth_frame()
+        if not color or not depth:
+            raise RuntimeError("未获取到完整的 color/depth 帧。")
+        result["framed"].append(serial)
+
+    result["ok"] = True
+    result["failed_serial"] = ""
+    result["stage"] = "done"
+except Exception as e:
+    result["error"] = repr(e)
+finally:
+    for _, p in pipes:
+        try:
+            p.stop()
+        except Exception:
+            pass
+
+print(json.dumps(result, ensure_ascii=False))
+"""
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", probe_code],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "error": "多机联合预检超时。",
+                "failed_serial": "",
+                "stage": "timeout",
+                "started": [],
+                "framed": [],
+                "crashed": False,
+                "returncode": None,
+            }
+
+        if completed.returncode != 0:
+            stderr = completed.stderr.strip()
+            err = stderr if stderr else f"子进程异常退出 (code={completed.returncode})"
+            return {
+                "ok": False,
+                "error": err,
+                "failed_serial": "",
+                "stage": "subprocess",
+                "started": [],
+                "framed": [],
+                "crashed": completed.returncode < 0,
+                "returncode": completed.returncode,
+            }
+
+        stdout = completed.stdout.strip().splitlines()
+        if not stdout:
+            return {
+                "ok": False,
+                "error": "多机联合预检未返回结果。",
+                "failed_serial": "",
+                "stage": "parse",
+                "started": [],
+                "framed": [],
+                "crashed": False,
+                "returncode": completed.returncode,
+            }
+
+        try:
+            payload = json.loads(stdout[-1])
+            return {
+                "ok": bool(payload.get("ok", False)),
+                "error": str(payload.get("error", "")),
+                "failed_serial": str(payload.get("failed_serial", "")),
+                "stage": str(payload.get("stage", "")),
+                "started": payload.get("started", []),
+                "framed": payload.get("framed", []),
+                "crashed": False,
+                "returncode": completed.returncode,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"解析多机预检结果失败: {exc}",
+                "failed_serial": "",
+                "stage": "parse",
+                "started": [],
+                "framed": [],
+                "crashed": False,
+                "returncode": completed.returncode,
+            }
+
+    @staticmethod
+    def estimate_color_depth_stream_upper_bound_mbps(width: int, height: int, fps: int) -> float:
+        """
+        Rough upper-bound estimate using app-requested formats: color BGR8 + depth Z16.
+        """
+        pixels_per_second = int(width) * int(height) * int(fps)
+        bits_per_pixel = 24 + 16
+        return float((pixels_per_second * bits_per_pixel) / 1_000_000.0)
 
     @property
     def is_running(self) -> bool:

@@ -234,6 +234,9 @@ class MainWindow(QMainWindow):
         self.view_to_source: Dict[str, str] = {}
         self.source_to_views: Dict[str, list[str]] = {}
         self.started_sources: Dict[str, Dict] = {}
+        self.pending_source_queue: list[str] = []
+        self.pending_start_config: Optional[Tuple[int, int, int]] = None
+        self.startup_failed: bool = False
 
         self.camera_intrinsics_by_cam: Dict[str, Dict] = {}
         self.normals_estimators: Dict[str, NormalsEstimator] = {}
@@ -333,7 +336,7 @@ class MainWindow(QMainWindow):
 
         resolution_row = QHBoxLayout()
         self.combo_resolution = QComboBox()
-        self.combo_resolution.addItems(["640x480", "848x480", "1280x720"])
+        self.combo_resolution.addItems(["640x360", "640x480", "848x480", "1280x720"])
         self.combo_resolution.setCurrentText("640x480")
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(6, 60)
@@ -580,8 +583,9 @@ class MainWindow(QMainWindow):
         for item in devices:
             serial = str(item.get("serial_number", "")).strip()
             name = str(item.get("name", "RealSense")).strip() or "RealSense"
+            usb_type = str(item.get("usb_type", "")).strip()
             if serial:
-                filtered.append({"serial_number": serial, "name": name})
+                filtered.append({"serial_number": serial, "name": name, "usb_type": usb_type})
 
         self.device_catalog = filtered
 
@@ -598,7 +602,8 @@ class MainWindow(QMainWindow):
                 combo.addItem("未检测到设备", "")
             else:
                 for dev in filtered:
-                    label = f"{dev['name']} | SN:{dev['serial_number']}"
+                    usb_suffix = f" | USB:{dev['usb_type']}" if dev.get("usb_type") else ""
+                    label = f"{dev['name']} | SN:{dev['serial_number']}{usb_suffix}"
                     combo.addItem(label, dev["serial_number"])
 
                 prev_serial = previous.get(key, "")
@@ -714,6 +719,11 @@ class MainWindow(QMainWindow):
 
         width, height = self.parse_resolution()
         fps = self.spin_fps.value()
+        serial_to_device = {
+            str(item.get("serial_number", "")).strip(): item
+            for item in self.device_catalog
+            if str(item.get("serial_number", "")).strip()
+        }
 
         for serial in unique_serials:
             start_probe = RealSenseCamera.probe_stream_start_safe(
@@ -735,26 +745,63 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"设备 SN:{serial} 预检失败: {err_text}", 8000)
                 return
 
+        if len(unique_serials) > 1:
+            multi_probe = RealSenseCamera.probe_multi_stream_start_safe(
+                serial_numbers=unique_serials,
+                width=width,
+                height=height,
+                fps=fps,
+                timeout_sec=max(20.0, 8.0 * len(unique_serials)),
+            )
+            if not multi_probe.get("ok"):
+                err_text = multi_probe.get("error", "未知错误")
+                failed_serial = str(multi_probe.get("failed_serial", "")).strip()
+                stage = str(multi_probe.get("stage", "")).strip() or "未知"
+                per_camera_upper = RealSenseCamera.estimate_color_depth_stream_upper_bound_mbps(width, height, fps)
+                total_upper = per_camera_upper * len(unique_serials)
+
+                usb_lines = []
+                for serial in unique_serials:
+                    device = serial_to_device.get(serial, {})
+                    usb_type = str(device.get("usb_type", "")).strip() or "未知"
+                    usb_lines.append(f"SN:{serial} -> USB:{usb_type}")
+
+                likely_causes = []
+                if any("3" not in str(serial_to_device.get(serial, {}).get("usb_type", "")) for serial in unique_serials):
+                    likely_causes.append("至少一台设备没有以 USB 3.x 枚举，Hub/线缆/转接器很可疑。")
+                if total_upper >= 1000.0:
+                    likely_causes.append(
+                        f"当前模式理论上限约 {total_upper:.0f} Mbps，三机共享总线时已经接近高风险区。"
+                    )
+                if not likely_causes:
+                    likely_causes.append("更像是 Hub 供电/USB 拓扑，或多设备并发初始化时序导致的问题。")
+
+                failed_text = f"失败设备: SN:{failed_serial}\n" if failed_serial else ""
+                usb_text = "\n".join(usb_lines)
+                cause_text = "\n".join(likely_causes)
+                QMessageBox.critical(
+                    self,
+                    "多机联合预检失败",
+                    f"三路相机单台都能启动，但一起启动失败。\n"
+                    f"这说明问题基本不在单台设备本身，而在共享 USB 链路/Hub/供电/并发启动时序。\n\n"
+                    f"阶段: {stage}\n"
+                    f"{failed_text}"
+                    f"详细信息: {err_text}\n\n"
+                    f"设备链路:\n{usb_text}\n\n"
+                    f"判断:\n{cause_text}\n\n"
+                    "建议先改用 640x360 @ 30 FPS，再确认三台都直连 USB 3.x 或接入独立供电 Hub。"
+                )
+                self.statusBar().showMessage(f"多机联合预检失败: {err_text}", 10000)
+                return
+
         self.camera_intrinsics_by_cam.clear()
         self.normals_estimators.clear()
         self.latest_color_bgr.clear()
         self.latest_depth_u16.clear()
         self.started_sources.clear()
-
-        for serial in unique_serials:
-            worker = CameraWorker(
-                camera_key=serial,
-                serial_number=serial,
-                width=width,
-                height=height,
-                fps=fps,
-            )
-            worker.frame_ready.connect(self._on_frame_ready)
-            worker.camera_started.connect(self._on_camera_started)
-            worker.camera_stopped.connect(self._on_camera_stopped)
-            worker.error_signal.connect(self._on_worker_error)
-            worker.start()
-            self.workers[serial] = worker
+        self.pending_source_queue = list(unique_serials)
+        self.pending_start_config = (width, height, fps)
+        self.startup_failed = False
 
         self.btn_start_camera.setEnabled(False)
         self.btn_stop_camera.setEnabled(True)
@@ -763,10 +810,17 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"相机启动中: 物理设备 {len(unique_serials)} 台，逻辑视图 3 路"
         )
+        self._start_next_worker()
 
     def stop_camera(self) -> None:
         if not self.workers:
+            self.pending_source_queue.clear()
+            self.pending_start_config = None
+            self.startup_failed = False
             return
+
+        self.pending_source_queue.clear()
+        self.pending_start_config = None
 
         for worker in self.workers.values():
             if worker.isRunning():
@@ -781,7 +835,28 @@ class MainWindow(QMainWindow):
         self.btn_stop_camera.setEnabled(False)
         self.btn_capture_save.setEnabled(False)
         self.lbl_camera_status.setText("已停止")
+        self.startup_failed = False
         self.statusBar().showMessage("相机已停止")
+
+    def _start_next_worker(self) -> None:
+        if self.pending_start_config is None or not self.pending_source_queue:
+            return
+
+        width, height, fps = self.pending_start_config
+        serial = self.pending_source_queue.pop(0)
+        worker = CameraWorker(
+            camera_key=serial,
+            serial_number=serial,
+            width=width,
+            height=height,
+            fps=fps,
+        )
+        worker.frame_ready.connect(self._on_frame_ready)
+        worker.camera_started.connect(self._on_camera_started)
+        worker.camera_stopped.connect(self._on_camera_stopped)
+        worker.error_signal.connect(self._on_worker_error)
+        self.workers[serial] = worker
+        worker.start()
 
     def _on_camera_started(self, source_key: str, intrinsics: Dict) -> None:
         self.started_sources[source_key] = intrinsics
@@ -794,6 +869,10 @@ class MainWindow(QMainWindow):
         started = len(self.started_sources)
         total = max(len(self.source_to_views), 1)
         self.lbl_camera_status.setText(f"运行中: {started}/{total}（视图: 3）")
+
+        if self.pending_source_queue:
+            self._start_next_worker()
+            return
 
         if started == total:
             payload = {
@@ -816,12 +895,29 @@ class MainWindow(QMainWindow):
         self.started_sources.pop(source_key, None)
 
         if not self.workers:
+            self.pending_source_queue.clear()
+            self.pending_start_config = None
             self.btn_start_camera.setEnabled(True)
             self.btn_stop_camera.setEnabled(False)
             self.btn_capture_save.setEnabled(False)
             self.lbl_camera_status.setText("已停止")
 
     def _on_worker_error(self, source_key: str, msg: str) -> None:
+        if source_key not in self.started_sources and not self.startup_failed:
+            self.startup_failed = True
+            self.pending_source_queue.clear()
+            bound_views = ",".join(CAMERA_TEXT.get(v, v) for v in self.source_to_views.get(source_key, []))
+            extra = f"（{bound_views}）" if bound_views else ""
+            QMessageBox.critical(
+                self,
+                "相机启动失败",
+                f"设备 SN:{source_key}{extra} 在启动阶段失败。\n"
+                f"详细信息: {msg}\n\n"
+                "这更像是多机共享 USB 链路、Hub 供电，或并发初始化导致的问题。"
+            )
+            self.stop_camera()
+            return
+
         bound_views = ",".join(CAMERA_TEXT.get(v, v) for v in self.source_to_views.get(source_key, []))
         if bound_views:
             self.statusBar().showMessage(f"设备 SN:{source_key}（{bound_views}）: {msg}", 6000)
