@@ -176,13 +176,22 @@ class CameraWorker(QThread):
     camera_stopped = pyqtSignal(str)  # camera_key
     error_signal = pyqtSignal(str, str)  # camera_key, message
 
-    def __init__(self, camera_key: str, serial_number: str, width: int, height: int, fps: int) -> None:
+    def __init__(
+        self,
+        camera_key: str,
+        serial_number: str,
+        width: int,
+        height: int,
+        fps: int,
+        use_default_profile: bool = False,
+    ) -> None:
         super().__init__()
         self.camera_key = camera_key
         self.serial_number = serial_number
         self.width = width
         self.height = height
         self.fps = fps
+        self.use_default_profile = use_default_profile
         self._stop_event = Event()
 
     def stop(self) -> None:
@@ -197,6 +206,7 @@ class CameraWorker(QThread):
                     height=self.height,
                     fps=self.fps,
                     serial_number=self.serial_number,
+                    use_default_profile=self.use_default_profile,
                 )
             )
             intrinsics = camera.get_intrinsics()
@@ -235,7 +245,7 @@ class MainWindow(QMainWindow):
         self.source_to_views: Dict[str, list[str]] = {}
         self.started_sources: Dict[str, Dict] = {}
         self.pending_source_queue: list[str] = []
-        self.pending_start_config: Optional[Tuple[int, int, int]] = None
+        self.pending_start_config: Optional[Tuple[int, int, int, bool]] = None
         self.startup_failed: bool = False
 
         self.camera_intrinsics_by_cam: Dict[str, Dict] = {}
@@ -336,7 +346,7 @@ class MainWindow(QMainWindow):
 
         resolution_row = QHBoxLayout()
         self.combo_resolution = QComboBox()
-        self.combo_resolution.addItems(["640x360", "640x480", "848x480", "1280x720"])
+        self.combo_resolution.addItems(["Auto (官方默认)", "640x360", "640x480", "848x480", "1280x720"])
         self.combo_resolution.setCurrentText("640x480")
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(6, 60)
@@ -625,8 +635,14 @@ class MainWindow(QMainWindow):
             mapping[key] = str(self.device_combos[key].currentData() or "").strip()
         return mapping
 
+    def _use_default_profile(self) -> bool:
+        return self.combo_resolution.currentText().startswith("Auto")
+
     def _on_resolution_or_fps_changed(self) -> None:
-        self.lbl_resolution_status.setText(f"{self.combo_resolution.currentText()} @ {self.spin_fps.value()} FPS")
+        if self._use_default_profile():
+            self.lbl_resolution_status.setText("Auto (官方默认)")
+        else:
+            self.lbl_resolution_status.setText(f"{self.combo_resolution.currentText()} @ {self.spin_fps.value()} FPS")
 
     def _on_light_label_changed(self) -> None:
         self.lbl_light_status.setText(self.get_selected_light_label())
@@ -719,6 +735,7 @@ class MainWindow(QMainWindow):
 
         width, height = self.parse_resolution()
         fps = self.spin_fps.value()
+        use_default_profile = self._use_default_profile()
         serial_to_device = {
             str(item.get("serial_number", "")).strip(): item
             for item in self.device_catalog
@@ -731,6 +748,7 @@ class MainWindow(QMainWindow):
                 height=height,
                 fps=fps,
                 serial_number=serial,
+                use_default_profile=use_default_profile,
                 timeout_sec=8.0,
             )
             if not start_probe.get("ok"):
@@ -751,8 +769,45 @@ class MainWindow(QMainWindow):
                 width=width,
                 height=height,
                 fps=fps,
+                use_default_profile=use_default_profile,
                 timeout_sec=max(20.0, 8.0 * len(unique_serials)),
             )
+            if not multi_probe.get("ok"):
+                if not use_default_profile:
+                    auto_probe = RealSenseCamera.probe_multi_stream_start_safe(
+                        serial_numbers=unique_serials,
+                        width=width,
+                        height=height,
+                        fps=fps,
+                        use_default_profile=True,
+                        timeout_sec=max(20.0, 8.0 * len(unique_serials)),
+                    )
+                    use_default_profile = True
+                    multi_probe = auto_probe
+                    if auto_probe.get("ok"):
+                        self.lbl_resolution_status.setText("Auto (官方默认)")
+                        self.statusBar().showMessage(
+                            "显式分辨率/格式失败，已自动切换到官方默认 profile 启动。",
+                            8000,
+                        )
+
+            if not multi_probe.get("ok") and use_default_profile:
+                err_text = multi_probe.get("error", "未知错误")
+                failed_serial = str(multi_probe.get("failed_serial", "")).strip()
+                stage = str(multi_probe.get("stage", "")).strip() or "未知"
+                failed_text = f"失败设备: SN:{failed_serial}\n" if failed_serial else ""
+                QMessageBox.critical(
+                    self,
+                    "多机联合预检失败",
+                    f"即使使用官方默认 profile，多机联合预检仍然失败。\n\n"
+                    f"阶段: {stage}\n"
+                    f"{failed_text}"
+                    f"详细信息: {err_text}\n\n"
+                    "这时才更像是运行时环境或 pyrealsense2/系统层兼容问题。"
+                )
+                self.statusBar().showMessage(f"多机联合预检失败: {err_text}", 10000)
+                return
+
             if not multi_probe.get("ok"):
                 err_text = multi_probe.get("error", "未知错误")
                 failed_serial = str(multi_probe.get("failed_serial", "")).strip()
@@ -800,7 +855,7 @@ class MainWindow(QMainWindow):
         self.latest_depth_u16.clear()
         self.started_sources.clear()
         self.pending_source_queue = list(unique_serials)
-        self.pending_start_config = (width, height, fps)
+        self.pending_start_config = (width, height, fps, use_default_profile)
         self.startup_failed = False
 
         self.btn_start_camera.setEnabled(False)
@@ -842,7 +897,7 @@ class MainWindow(QMainWindow):
         if self.pending_start_config is None or not self.pending_source_queue:
             return
 
-        width, height, fps = self.pending_start_config
+        width, height, fps, use_default_profile = self.pending_start_config
         serial = self.pending_source_queue.pop(0)
         worker = CameraWorker(
             camera_key=serial,
@@ -850,6 +905,7 @@ class MainWindow(QMainWindow):
             width=width,
             height=height,
             fps=fps,
+            use_default_profile=use_default_profile,
         )
         worker.frame_ready.connect(self._on_frame_ready)
         worker.camera_started.connect(self._on_camera_started)

@@ -6,6 +6,7 @@ import subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 try:
@@ -22,10 +23,12 @@ class CameraConfig:
     height: int = 480
     fps: int = 30
     serial_number: str = ""
+    use_default_profile: bool = False
 
 
 class RealSenseCamera:
     """Intel RealSense D435 wrapper with explicit depth-to-color alignment."""
+    _shared_context = None
 
     def __init__(self) -> None:
         self.pipeline: Optional[rs.pipeline] = None
@@ -46,13 +49,20 @@ class RealSenseCamera:
     @staticmethod
     def has_device() -> bool:
         RealSenseCamera._ensure_rs_available()
-        context = rs.context()
+        context = RealSenseCamera._get_shared_context()
         return len(context.query_devices()) > 0
+
+    @staticmethod
+    def _get_shared_context():
+        RealSenseCamera._ensure_rs_available()
+        if RealSenseCamera._shared_context is None:
+            RealSenseCamera._shared_context = rs.context()
+        return RealSenseCamera._shared_context
 
     @staticmethod
     def first_device_info() -> Dict[str, str]:
         RealSenseCamera._ensure_rs_available()
-        context = rs.context()
+        context = RealSenseCamera._get_shared_context()
         devices = context.query_devices()
         if len(devices) == 0:
             return {}
@@ -247,11 +257,19 @@ print(json.dumps({"device_count": int(len(devices)), "devices": items}, ensure_a
         height: int,
         fps: int,
         serial_number: str = "",
+        use_default_profile: bool = False,
         timeout_sec: float = 8.0,
     ) -> Dict:
         """
         Try starting/stopping pipeline in subprocess to guard GUI from native crash.
         """
+        stream_setup = """
+    c.enable_stream(rs.stream.color)
+    c.enable_stream(rs.stream.depth)
+""" if use_default_profile else f"""
+    c.enable_stream(rs.stream.color, {int(width)}, {int(height)}, rs.format.any, {int(fps)})
+    c.enable_stream(rs.stream.depth, {int(width)}, {int(height)}, rs.format.z16, {int(fps)})
+"""
         probe_code = f"""
 import json
 import pyrealsense2 as rs
@@ -263,8 +281,7 @@ try:
     c = rs.config()
     if {bool(serial_number)!r}:
         c.enable_device({serial_number!r})
-    c.enable_stream(rs.stream.color, {int(width)}, {int(height)}, rs.format.bgr8, {int(fps)})
-    c.enable_stream(rs.stream.depth, {int(width)}, {int(height)}, rs.format.z16, {int(fps)})
+{stream_setup}
     p.start(c)
     frames = p.wait_for_frames(3000)
     color = frames.get_color_frame()
@@ -335,6 +352,7 @@ print(json.dumps(result, ensure_ascii=False))
         width: int,
         height: int,
         fps: int,
+        use_default_profile: bool = False,
         timeout_sec: float = 20.0,
         startup_delay_sec: float = 0.35,
     ) -> Dict:
@@ -342,6 +360,13 @@ print(json.dumps(result, ensure_ascii=False))
         Start multiple pipelines sequentially in a subprocess and wait for frames from all devices.
         """
         serials = [str(item).strip() for item in serial_numbers if str(item).strip()]
+        stream_setup = """
+        c.enable_stream(rs.stream.color)
+        c.enable_stream(rs.stream.depth)
+""" if use_default_profile else f"""
+        c.enable_stream(rs.stream.color, {int(width)}, {int(height)}, rs.format.any, {int(fps)})
+        c.enable_stream(rs.stream.depth, {int(width)}, {int(height)}, rs.format.z16, {int(fps)})
+"""
         probe_code = f"""
 import json
 import time
@@ -366,8 +391,7 @@ try:
         p = rs.pipeline()
         c = rs.config()
         c.enable_device(serial)
-        c.enable_stream(rs.stream.color, {int(width)}, {int(height)}, rs.format.bgr8, {int(fps)})
-        c.enable_stream(rs.stream.depth, {int(width)}, {int(height)}, rs.format.z16, {int(fps)})
+{stream_setup}
         p.start(c)
         pipes.append((serial, p))
         result["started"].append(serial)
@@ -480,20 +504,69 @@ print(json.dumps(result, ensure_ascii=False))
     def is_running(self) -> bool:
         return self._running
 
+    @staticmethod
+    def _reshape_packed_color(raw: np.ndarray, height: int, width: int, channels: int) -> np.ndarray:
+        if raw.ndim == 3:
+            return raw
+        if raw.ndim == 2 and raw.shape == (height, width * channels):
+            return raw.reshape(height, width, channels)
+        if raw.ndim == 1 and raw.size == height * width * channels:
+            return raw.reshape(height, width, channels)
+        return raw
+
+    @staticmethod
+    def _color_frame_to_bgr(color_frame) -> np.ndarray:
+        profile = color_frame.get_profile().as_video_stream_profile()
+        fmt = profile.format()
+        intr = profile.get_intrinsics()
+        width = int(intr.width)
+        height = int(intr.height)
+        raw = np.asanyarray(color_frame.get_data())
+
+        if fmt == rs.format.bgr8:
+            color = raw
+        elif fmt == rs.format.rgb8:
+            color = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+        elif fmt == rs.format.yuyv:
+            yuyv = RealSenseCamera._reshape_packed_color(raw, height, width, 2)
+            color = cv2.cvtColor(yuyv, cv2.COLOR_YUV2BGR_YUYV)
+        elif hasattr(rs.format, "uyvy") and fmt == rs.format.uyvy:
+            uyvy = RealSenseCamera._reshape_packed_color(raw, height, width, 2)
+            color = cv2.cvtColor(uyvy, cv2.COLOR_YUV2BGR_UYVY)
+        elif fmt == rs.format.mjpeg:
+            mjpeg = raw.reshape(-1)
+            color = cv2.imdecode(mjpeg, cv2.IMREAD_COLOR)
+            if color is None:
+                raise RuntimeError("MJPEG 解码失败。")
+        else:
+            raise RuntimeError(f"不支持的彩色流格式: {fmt}")
+
+        if color is None or color.size == 0:
+            raise RuntimeError("彩色帧解码失败。")
+        return color
+
     def start(self, cam_cfg: CameraConfig) -> None:
         if self._running:
             return
 
         self._ensure_rs_available()
 
-        self.pipeline = rs.pipeline()
+        try:
+            self.pipeline = rs.pipeline(self._get_shared_context())
+        except TypeError:
+            self.pipeline = rs.pipeline()
         self.config = rs.config()
 
         if cam_cfg.serial_number:
             self.config.enable_device(cam_cfg.serial_number)
 
-        self.config.enable_stream(rs.stream.color, cam_cfg.width, cam_cfg.height, rs.format.bgr8, cam_cfg.fps)
-        self.config.enable_stream(rs.stream.depth, cam_cfg.width, cam_cfg.height, rs.format.z16, cam_cfg.fps)
+        if cam_cfg.use_default_profile:
+            self.config.enable_stream(rs.stream.color)
+            self.config.enable_stream(rs.stream.depth)
+        else:
+            # Let librealsense negotiate the actual color format, matching the viewer/multicam sample behavior.
+            self.config.enable_stream(rs.stream.color, cam_cfg.width, cam_cfg.height, rs.format.any, cam_cfg.fps)
+            self.config.enable_stream(rs.stream.depth, cam_cfg.width, cam_cfg.height, rs.format.z16, cam_cfg.fps)
 
         try:
             self.profile = self.pipeline.start(self.config)
@@ -513,6 +586,8 @@ print(json.dumps(result, ensure_ascii=False))
 
         color_stream = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
         color_intr = color_stream.get_intrinsics()
+        depth_stream = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        depth_intr = depth_stream.get_intrinsics()
 
         self.intrinsics = {
             "width": int(color_intr.width),
@@ -525,6 +600,12 @@ print(json.dumps(result, ensure_ascii=False))
             "distortion_coeffs": [float(v) for v in color_intr.coeffs],
             "depth_scale": float(self.depth_scale),
             "serial_number": self.serial_number,
+            "color_format": str(color_stream.format()),
+            "color_fps": int(color_stream.fps()),
+            "depth_format": str(depth_stream.format()),
+            "depth_width": int(depth_intr.width),
+            "depth_height": int(depth_intr.height),
+            "depth_fps": int(depth_stream.fps()),
         }
 
         self._running = True
@@ -559,7 +640,7 @@ print(json.dumps(result, ensure_ascii=False))
         if not color_frame or not depth_frame:
             raise RuntimeError("帧数据不完整（color/depth 缺失）。")
 
-        color = np.asanyarray(color_frame.get_data())
+        color = self._color_frame_to_bgr(color_frame)
         depth = np.asanyarray(depth_frame.get_data())
 
         if color is None or depth is None:
